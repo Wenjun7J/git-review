@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""Review and edit a linear Git history, one unstaged commit at a time."""
+import argparse
+import collections
+import contextlib
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import uuid
+
+VERSION = "0.1.0"
+MARKER = re.compile(rb"^(?:<{7,}(?: .*)?|={7,}|\|{7,}(?: .*)?|>{7,}(?: .*)?)\r?$")
+
+
+class ReviewError(Exception):
+    pass
+
+
+def git(*args, cwd=None, check=True, env=None, data=None):
+    process_env = os.environ.copy()
+    process_env.update({"GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0"})
+    if env:
+        process_env.update(env)
+    result = subprocess.run(["git", *args], cwd=cwd, env=process_env,
+                            input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode:
+        detail = (result.stderr + result.stdout).decode(errors="replace").strip()
+        raise ReviewError(f"git {args[0]} failed:\n{detail}")
+    return result
+
+
+def decoded(data):
+    return os.fsdecode(data)
+
+
+def paths(data):
+    return [decoded(p) for p in data.split(b"\0") if p]
+
+
+def display(path):
+    return json.dumps(path, ensure_ascii=False) if any(c in path for c in "\n\r\t") else path
+
+
+class Review:
+    def __init__(self):
+        self.root = Path(decoded(git("rev-parse", "--show-toplevel").stdout).strip())
+        self.gitdir = Path(self.out("rev-parse", "--absolute-git-dir"))
+        self.directory = self.gitdir / "git-review"
+        self.state_path = self.directory / "active.json"
+        self.state = None
+
+    def run(self, *args, **kwargs):
+        return git(*args, cwd=self.root, **kwargs)
+
+    def out(self, *args):
+        return decoded(self.run(*args).stdout).strip()
+
+    @contextlib.contextmanager
+    def locked(self):
+        self.directory.mkdir(exist_ok=True)
+        with (self.directory / "lock").open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ReviewError("Another git review command is running. Wait for it to finish.")
+            if self.state_path.exists():
+                self.state = json.loads(self.state_path.read_text())
+            yield
+
+    def save(self):
+        fd, name = tempfile.mkstemp(prefix="active-", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(self.state, stream, ensure_ascii=True, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, self.state_path)
+            dirfd = os.open(self.directory, os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    def archive(self, outcome):
+        self.state["outcome"] = outcome
+        self.save()
+        history = self.directory / "history"
+        history.mkdir(exist_ok=True)
+        os.replace(self.state_path, history / (self.state["id"] + ".json"))
+
+    def rebase_active(self):
+        return (self.gitdir / "rebase-merge").is_dir()
+
+    def head(self):
+        return self.out("rev-parse", "HEAD")
+
+    def current(self):
+        return self.state["commits"][self.state["index"]]
+
+    def changed_paths(self):
+        return paths(self.run("diff", "--name-only", "-z", "HEAD", "--").stdout)
+
+    def untracked(self):
+        return paths(self.run("ls-files", "--others", "--exclude-standard", "-z").stdout)
+
+    def dirty(self):
+        return bool(self.run("status", "--porcelain=v1", "-z", "--untracked-files=all").stdout)
+
+    def unmerged(self):
+        result = collections.defaultdict(dict)
+        for record in self.run("ls-files", "--unmerged", "-z").stdout.split(b"\0"):
+            if record:
+                metadata, path = record.split(b"\t", 1)
+                mode, oid, stage = metadata.split()
+                result[decoded(path)][int(stage)] = (decoded(mode), decoded(oid))
+        return result
+
+    def marker_lines(self, path):
+        file = self.root / path
+        # Do not follow a symlink supplied by repository content.
+        if file.is_symlink() or not file.is_file():
+            return []
+        data = file.read_bytes()
+        if b"\0" in data:
+            return []
+        return [i for i, line in enumerate(data.splitlines(), 1) if MARKER.match(line)]
+
+    def stopped_sha(self):
+        path = self.gitdir / "rebase-merge" / "stopped-sha"
+        return path.read_text().strip() if path.exists() else None
+
+    def check_session(self):
+        if not self.state:
+            raise ReviewError("No active review. Run: git review start <commit>")
+        if not self.rebase_active():
+            raise ReviewError("The rebase for this review no longer exists. Run git review status to inspect the backup before rewriting any history.")
+        if self.run("symbolic-ref", "-q", "HEAD", check=False).returncode == 0:
+            raise ReviewError("HEAD must remain detached during a review. A manual branch switch was detected; stopping.")
+        branch = self.state["branch"]
+        if self.out("rev-parse", branch) != self.state["original_head"]:
+            raise ReviewError("The original branch changed outside this review. Stopping to avoid overwriting it.")
+
+    def rebase(self, *args):
+        helper = str(Path(__file__).resolve())
+        editor = shlex.join([sys.executable, helper, "--sequence-editor"])
+        return self.run("-c", "core.editor=true", "-c", "merge.conflictStyle=merge",
+                        "-c", "rerere.enabled=false", "-c", "rebase.instructionFormat=%s",
+                        "-c", "rebase.abbreviateCommands=false",
+                        "-c", "rebase.rescheduleFailedExec=false", "rebase", *args,
+                        env={"GIT_SEQUENCE_EDITOR": editor, "GIT_EDITOR": "true"}, check=False)
+
+    def start(self, revision):
+        if self.state:
+            raise ReviewError("A review is already active. Use next or abort first.")
+        for item in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "BISECT_LOG"):
+            if (self.gitdir / item).exists():
+                raise ReviewError(f"A Git operation is already in progress ({item}). Finish it first.")
+        branch_result = self.run("symbolic-ref", "-q", "HEAD", check=False)
+        if branch_result.returncode:
+            raise ReviewError("Start a review on a local branch, not from a detached HEAD.")
+        if self.dirty():
+            raise ReviewError("Starting a review requires a clean working tree, including untracked files. Commit, stash, or move existing changes first.")
+        if self.run("config", "--bool", "core.sparseCheckout", check=False).stdout.strip() == b"true":
+            raise ReviewError("This prototype does not support sparse checkout.")
+        for flag in ("-v", "-f"):
+            records = self.run("ls-files", flag, "-z").stdout.split(b"\0")
+            if any(r and (chr(r[0]).islower() or r[:1] == b"S") for r in records):
+                raise ReviewError("The index has assume-unchanged, skip-worktree, or fsmonitor-valid flags. Clear them first.")
+        first = self.out("rev-parse", "--verify", "--end-of-options", revision + "^{commit}")
+        original = self.head()
+        if self.run("merge-base", "--is-ancestor", first, original, check=False).returncode:
+            raise ReviewError("The starting commit must be an ancestor of the current HEAD, or HEAD itself.")
+        parent_line = self.out("rev-list", "--parents", "-n", "1", first).split()
+        if len(parent_line) != 2:
+            raise ReviewError("This prototype cannot start from a root commit or a merge commit.")
+        base = parent_line[1]
+        if self.out("rev-list", "--min-parents=2", f"{base}..{original}"):
+            raise ReviewError("The review range contains merge commits. This prototype only supports a contiguous, linear history.")
+        if any(r.startswith(b"160000 ") for r in self.run("ls-tree", "-r", base).stdout.splitlines()):
+            raise ReviewError("This prototype does not support review ranges containing submodules.")
+        commits = []
+        for sha in self.out("rev-list", "--reverse", f"{base}..{original}").splitlines():
+            if any(r.startswith(b"160000 ") for r in self.run("ls-tree", "-r", sha).stdout.splitlines()):
+                raise ReviewError("This prototype does not support review ranges containing submodules.")
+            commits.append({"sha": sha, "parent": self.out("rev-parse", sha + "^"),
+                            "tree": self.out("rev-parse", sha + "^{tree}"),
+                            "subject": self.out("show", "-s", "--format=%s", sha)})
+        self.run("var", "GIT_AUTHOR_IDENT")
+        session_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
+        backup = "refs/git-review/backups/" + session_id
+        self.run("update-ref", backup, original, "")
+        self.state = {"version": 1, "id": session_id, "phase": "starting", "branch": decoded(branch_result.stdout).strip(),
+                      "original_head": original, "backup_ref": backup, "root": str(self.root),
+                      "commits": commits, "index": 0, "saved": [], "conflicts": []}
+        self.save()
+        result = self.rebase("--interactive", "--no-autosquash", "--no-update-refs", "--no-autostash",
+                             "--no-rebase-merges", "--keep-empty", "--reapply-cherry-picks", "--empty=keep", base)
+        self.receive_stop(result)
+
+    def receive_stop(self, result=None):
+        if not self.rebase_active():
+            if self.state["index"] == len(self.state["commits"]):
+                self.finish()
+                return
+            if self.state["phase"] == "starting" and self.head() == self.state["original_head"]:
+                self.archive("start-failed")
+            detail = (result.stderr + result.stdout).decode(errors="replace") if result else ""
+            raise ReviewError("Git did not stop at the expected commit. The original history is still backed up.\n" + detail)
+        if self.state["index"] >= len(self.state["commits"]):
+            detail = (result.stderr + result.stdout).decode(errors="replace") if result else ""
+            raise ReviewError("Git has not finished the rebase. Resolve the following issue, then retry next.\n" + detail)
+        if self.stopped_sha() != self.current()["sha"]:
+            detail = (result.stderr + result.stdout).decode(errors="replace") if result else ""
+            raise ReviewError("Git stopped at a different commit than the review expected. The current state has been preserved.\n" + detail)
+        unresolved = self.unmerged()
+        if unresolved:
+            conflicts = []
+            for path, stages in sorted(unresolved.items()):
+                lines = self.marker_lines(path)
+                text = 2 in stages and 3 in stages and all(mode.startswith("100") for mode, _ in stages.values())
+                if text:
+                    text = all(b"\0" not in self.run("cat-file", "blob", oid).stdout for _, oid in stages.values())
+                conflicts.append({"path": path, "kind": "text" if text and lines else "manual",
+                                  "initial_marker_lines": lines})
+            self.state.update(phase="conflict", parent=self.head(), conflicts=conflicts)
+            self.save()
+            self.print_status()
+            return
+        self.state.update(phase="expanding", replayed_commit=self.head(),
+                          parent=self.out("rev-parse", "HEAD^"), conflicts=[])
+        self.save()
+        self.expand()
+
+    def expand(self):
+        current_head = self.head()
+        if current_head == self.state["replayed_commit"]:
+            self.run("reset", "--mixed", "-N", self.state["parent"])
+        elif current_head != self.state["parent"]:
+            raise ReviewError("HEAD changed unexpectedly while exposing the commit's changes. Stopping.")
+        self.state["phase"] = "reviewing"
+        self.save()
+        self.print_status()
+
+    def validate_edits(self):
+        marker_errors = []
+        for item in self.state["conflicts"]:
+            for line in self.marker_lines(item["path"]):
+                marker_errors.append(f"  {display(item['path'])}:{line}")
+        if marker_errors:
+            raise ReviewError("Conflict markers remain at the following locations. Nothing has been committed:\n" + "\n".join(marker_errors))
+        unresolved = self.unmerged()
+        automatic = {c["path"] for c in self.state["conflicts"] if c["kind"] == "text"}
+        manual = set(unresolved) - automatic
+        if manual:
+            raise ReviewError("The following conflicts require an explicit resolution. Choose the result, then mark it resolved with git add or git rm:\n" +
+                              "\n".join("  " + display(p) for p in sorted(manual)))
+        extra = set(self.untracked()) - set(unresolved)
+        if extra:
+            raise ReviewError("Additional untracked files have not been included in this commit. Use git add for files to include, or move them away before retrying next:\n" +
+                              "\n".join("  " + display(p) for p in sorted(extra)))
+
+    def next(self):
+        if self.state and not self.rebase_active() and self.state["phase"] == "advancing":
+            self.finish()
+            return
+        self.check_session()
+        phase = self.state["phase"]
+        if phase == "starting":
+            self.receive_stop()
+            return
+        if phase == "expanding":
+            self.expand()
+            return
+        if phase == "advancing":
+            self.resume_advance()
+            return
+        if phase == "aborting":
+            raise ReviewError("The abort operation was interrupted. Run git review abort again.")
+        if phase == "saving":
+            if self.head() != self.state["parent"]:
+                if self.out("rev-parse", "HEAD^") != self.state["parent"]:
+                    raise ReviewError("HEAD changed unexpectedly while saving the commit. Stopping.")
+                self.record_saved()
+                self.advance()
+                return
+            self.state["phase"] = self.state["save_from"]
+            self.save()
+        if self.state["phase"] == "saved":
+            self.advance()
+            return
+        if self.head() != self.state["parent"]:
+            raise ReviewError("HEAD changed outside this review. Do not commit, reset, or switch branches manually during a review. Stopping with the current state preserved.")
+        if self.stopped_sha() != self.current()["sha"]:
+            raise ReviewError("Git's current commit does not match the review state. Stopping.")
+        self.validate_edits()
+        self.state.update(phase="saving", save_from=self.state["phase"])
+        self.save()
+        self.run("add", "-u", "--", ".")
+        tree = self.out("write-tree")
+        current = self.current()
+        if tree == current["tree"] and self.head() == current["parent"]:
+            self.run("reset", "--soft", current["sha"])
+        else:
+            try:
+                self.run("commit", "--allow-empty", "--reuse-message=" + current["sha"])
+            except ReviewError:
+                if self.head() == self.state["parent"]:
+                    self.state["phase"] = self.state["save_from"]
+                    self.save()
+                raise
+        self.record_saved()
+        self.advance()
+
+    def record_saved(self):
+        old = self.current()["sha"]
+        new = self.head()
+        self.state["saved"].append({"old": old, "new": new})
+        self.state.update(phase="saved", saved_head=new)
+        self.save()
+        print(f"Saved [{self.state['index'] + 1}/{len(self.state['commits'])}]: {new[:12]} - {self.current()['subject']}")
+
+    def advance(self):
+        if self.head() != self.state["saved_head"]:
+            raise ReviewError("HEAD changed outside this review after the commit was saved. Stopping.")
+        if self.dirty():
+            # A hook may have modified files after git commit staged its tree. Let the
+            # user inspect those edits with the same parent rather than losing them.
+            if self.untracked():
+                raise ReviewError("Additional untracked files appeared after the commit. Move them away before retrying next.")
+            self.run("reset", "--mixed", "-N", self.state["parent"])
+            self.state["saved"].pop()
+            self.state["phase"] = self.state["save_from"]
+            self.save()
+            raise ReviewError("A commit hook left additional changes. The current commit has been reopened for review; inspect the changes before running next again.")
+        self.state.update(phase="advancing", previous_sha=self.current()["sha"], index=self.state["index"] + 1)
+        self.save()
+        self.resume_advance()
+
+    def resume_advance(self):
+        # Persisted before invoking rebase: a restart can distinguish "not run yet"
+        # from "already stopped at the next commit" using native rebase metadata.
+        if self.stopped_sha() == self.state["previous_sha"]:
+            result = self.rebase("--continue")
+            self.receive_stop(result)
+        else:
+            self.receive_stop()
+
+    def finish(self):
+        if self.state["index"] != len(self.state["commits"]):
+            raise ReviewError("The rebase ended early. Progress and backups have been preserved; check git review status.")
+        expected = self.state["saved"][-1]["new"]
+        if self.head() != expected or self.out("rev-parse", self.state["branch"]) != expected:
+            raise ReviewError("The final branch position does not match the expected result. Progress and backups have been preserved.")
+        self.state["result_head"] = expected
+        self.archive("completed")
+        print(f"Review complete: {len(self.state['commits'])} commits.")
+        print(f"Branch: {self.state['branch'].removeprefix('refs/heads/')}")
+        print(f"Original history backup: {self.state['backup_ref']}")
+        print("Results have been saved locally. Nothing was pushed.")
+
+    def snapshot(self):
+        # A separate index records even conflict markers and untracked files without
+        # resolving or modifying the real index. The ref makes the snapshot durable.
+        fd, name = tempfile.mkstemp(prefix="recovery-index-", dir=self.directory)
+        os.close(fd)
+        os.unlink(name)
+        env = {"GIT_INDEX_FILE": name}
+        try:
+            self.run("read-tree", "HEAD", env=env)
+            self.run("add", "-A", "--", ".", env=env)
+            tree = decoded(self.run("write-tree", env=env).stdout).strip()
+            sha = decoded(self.run("commit-tree", tree, "-p", self.head(),
+                                   data=b"git-review recovery snapshot\n").stdout).strip()
+            ref = "refs/git-review/recovery/" + self.state["id"]
+            self.run("update-ref", ref, sha)
+            return ref
+        finally:
+            for file in (name, name + ".lock"):
+                if os.path.exists(file):
+                    os.unlink(file)
+
+    def abort(self):
+        if not self.state:
+            raise ReviewError("No active review.")
+        if self.state["phase"] == "aborting" and not self.rebase_active():
+            if self.head() != self.state["original_head"]:
+                raise ReviewError("HEAD does not match the original branch after an interrupted abort. Stopping.")
+        else:
+            self.check_session()
+            if self.state["phase"] != "aborting":
+                self.state["recovery_ref"] = self.snapshot()
+                self.state["phase"] = "aborting"
+                self.save()
+            self.run("rebase", "--abort")
+        self.archive("aborted")
+        print("Review aborted. The branch has been restored to its original position.")
+        print(f"Files and commits saved before the abort can be recovered from: {self.state['recovery_ref']}")
+        if self.untracked():
+            print("Additional untracked files remain in the working tree; they were not deleted.")
+
+    def status_data(self):
+        if not self.state:
+            return {"active": False, "repository": str(self.root)}
+        state = self.state
+        conflicts = []
+        unresolved = self.unmerged()
+        for item in state["conflicts"]:
+            conflicts.append({"path": item["path"], "kind": item["kind"],
+                              "marker_lines": self.marker_lines(item["path"]),
+                              "unmerged": item["path"] in unresolved,
+                              "needs_manual_stage": item["kind"] == "manual" and item["path"] in unresolved})
+        current = dict(self.current()) if state["index"] < len(state["commits"]) else None
+        if current:
+            current["number"] = state["index"] + 1
+        return {"active": True, "repository": str(self.root), "phase": state["phase"],
+                "branch": state["branch"].removeprefix("refs/heads/"), "original_head": state["original_head"],
+                "head": self.head(), "backup_ref": state["backup_ref"], "total": len(state["commits"]),
+                "current": current, "completed": state["saved"], "remaining": state["commits"][state["index"]:],
+                "conflicts": conflicts, "changed_files": self.changed_paths(), "untracked_files": self.untracked(),
+                "rebase_active": self.rebase_active(), "next_action": "git review next"}
+
+    def print_status(self, as_json=False):
+        data = self.status_data()
+        if as_json:
+            print(json.dumps(data, ensure_ascii=True, indent=2))
+            return
+        if not data["active"]:
+            print("No active review. Run: git review start <commit>")
+            return
+        current = data["current"]
+        print(f"Branch: {data['branch']} | Phase: {data['phase']}")
+        if current:
+            print(f"Current [{current['number']}/{data['total']}]: {current['sha'][:12]} - {current['subject']}")
+        if data["conflicts"]:
+            marked = [c for c in data["conflicts"] if c["marker_lines"]]
+            if marked:
+                print("Both sides have been preserved with conflict markers in these files (path:line):")
+                for item in marked:
+                    print(f"  {display(item['path'])}:" + ",".join(map(str, item["marker_lines"])))
+            manual = [c for c in data["conflicts"] if c["needs_manual_stage"]]
+            if manual:
+                print("Choose a resolution for these conflicts, then use git add or git rm:")
+                for item in manual:
+                    print("  " + display(item["path"]))
+            if not marked and not manual:
+                print("Conflict markers have been removed. Run next to save the resolution automatically.")
+        if data["changed_files"]:
+            print("Files in the current review:")
+            for path in data["changed_files"]:
+                print("  " + display(path))
+        print("Review and edit the files in VS Code, then run git review next.")
+        print(f"Original history backup: {data['backup_ref']}")
+
+
+def sequence_editor(path):
+    file = Path(path)
+    data = file.read_bytes()
+    file.write_bytes(re.sub(rb"(?m)^pick ", b"edit ", data))
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--sequence-editor":
+        sequence_editor(sys.argv[2])
+        return 0
+    parser = argparse.ArgumentParser(description="Review and edit Git commits one at a time as unstaged changes.")
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="command", required=True)
+    start = sub.add_parser("start", help="Review from the specified commit, inclusive, through the current HEAD")
+    start.add_argument("commit")
+    sub.add_parser("next", help="Save the current commit or conflict resolution and open the next commit")
+    status = sub.add_parser("status", help="Show review progress and conflicting files")
+    status.add_argument("--json", action="store_true", help="Output machine-readable JSON for AI agents and scripts")
+    sub.add_parser("abort", help="Save a recovery snapshot, cancel the review, and restore the original branch")
+    args = parser.parse_args()
+    try:
+        review = Review()
+        with review.locked():
+            if args.command == "start":
+                review.start(args.commit)
+            elif args.command == "next":
+                review.next()
+            elif args.command == "abort":
+                review.abort()
+            else:
+                review.print_status(args.json)
+        return 0
+    except (ReviewError, OSError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Operation interrupted. Files and progress have been preserved; run git review status to inspect them.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
