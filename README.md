@@ -13,7 +13,22 @@ export PATH="$HOME/bin:$PATH"  # If ~/bin is not already on this shell's PATH
 git review --version
 ```
 
-The installer creates symlinks at `~/bin/git-review` and `$CODEX_HOME/skills/git-review` (or `~/.codex/skills/git-review` if `CODEX_HOME` is unset). It refuses to replace an unrelated command or skill. You can also run `~/git-review/git-review` directly.
+The installer creates the command symlink at `~/bin/git-review`. The command works on its own; no AI tool or skill is required. You can also run `~/git-review/git-review` directly.
+
+Skills are optional. By default, the installer detects Codex and Claude Code using their commands on PATH or their existing configuration directories, then installs a skill only for each detected tool:
+
+| Tool | Command | Configuration directory | Skill destination |
+| --- | --- | --- | --- |
+| Codex | `codex` | `$CODEX_HOME`, defaulting to `~/.codex` | `<config>/skills/git-review` |
+| Claude Code | `claude` | `$CLAUDE_CONFIG_DIR`, defaulting to `~/.claude` | `<config>/skills/git-review` |
+
+If neither tool is detected, no skill is installed and no AI configuration directory is created. To skip skill installation even when AI tools are detected:
+
+```bash
+python3 install.py --no-skills
+```
+
+The installer never replaces an unrelated command or skill. A missing or unavailable skill destination does not prevent command installation: optional skill failures are reported and skipped. Re-running the installer is safe, and `--no-skills` leaves previously installed skills untouched. Claude Code's personal skill location and configuration override follow its [skills documentation](https://code.claude.com/docs/en/skills) and [environment variable reference](https://code.claude.com/docs/en/env-vars).
 
 ## Usage
 
@@ -51,7 +66,7 @@ Edit the files to their intended final content in VS Code, remove the markers, a
 
 Binary, modify/delete, rename, and other conflicts that cannot be resolved through ordinary text markers are listed separately. Choose the final result, then use `git add <path>` or `git rm <path>` before running `next`. The tool does not choose a side for you.
 
-## Status and the AI skill
+## Status and the optional AI skill
 
 ```bash
 git review status
@@ -60,9 +75,9 @@ git review status --json
 
 The JSON output includes `active`, `phase`, the current commit and its position, remaining commits, the original branch, saved SHA mappings, conflict files and marker lines, changed files, and the backup ref. With no active session, it returns `active: false` and exits successfully. Unexpected Git metadata or external operations cause the tool to report an error and preserve the current state.
 
-The bundled [git-review skill](skills/git-review/SKILL.md) tells an AI agent to check the session state before editing the current commit. In a new conversation, you can say: "Use $git-review to edit the current commit, then run next." The skill does not depend on context from an earlier conversation. A request to edit files alone does not authorize advancing the review. An ordinary Git rebase is not treated as a git-review session.
+The optional [git-review skill](skills/git-review/SKILL.md) tells an AI agent to check the session state before editing the current commit. Invoke it with `$git-review` in Codex or `/git-review` in Claude Code; for example, ask it to edit the current commit, then run next. The skill does not depend on context from an earlier conversation. A request to edit files alone does not authorize advancing the review. An ordinary Git rebase is not treated as a git-review session. All command-line review operations work without the skill.
 
-When working over SSH, run commands on the host and in the repository that contain the actual review. A non-login SSH session may not include `~/bin` on PATH; use `~/git-review/git-review status --json` in that case. If the AI runs locally while editing a remote repository, also install this project's `skills/git-review/` directory in the local AI's skill directory.
+When working over SSH, run commands on the host and in the repository that contain the actual review. A non-login SSH session may not include `~/bin` on PATH; use `~/git-review/git-review status --json` in that case. If you want skill assistance from a local AI while editing a remote repository, optionally install this project's `skills/git-review/` directory in the local AI's skill directory.
 
 ## Aborting and recovering
 
