@@ -70,8 +70,22 @@ Binary, modify/delete, rename, and other conflicts that cannot be resolved throu
 
 ```bash
 git review status
+git review list
 git review status --json
 ```
+
+`git review list` shows the ordered commit list and a summary of completed and remaining commits. The remaining count includes the current commit. Each row shows its position, status, original SHA, and subject; `>` marks the current commit. A conflicting commit is labeled `conflict`:
+
+```text
+Branch: feature | Phase: reviewing
+Total: 3 | Completed: 1 | Remaining: 2 (including current)
+
+  1  done     a1b2c3d4e5f6 - Add parser
+> 2  current  b2c3d4e5f6a1 - Handle empty input
+  3  pending  c3d4e5f6a1b2 - Add regression coverage
+```
+
+Listing commits does not change files, staging, HEAD, or review progress. If no review is active, it prints a message explaining how to start one.
 
 The JSON output includes `active`, `phase`, the current commit and its position, remaining commits, the original branch, saved SHA mappings, conflict files and marker lines, changed files, and the backup ref. With no active session, it returns `active: false` and exits successfully. Unexpected Git metadata or external operations cause the tool to report an error and preserve the current state.
 

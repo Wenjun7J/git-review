@@ -430,6 +430,9 @@ class ReviewTest(unittest.TestCase):
         self.review("start", first)
         self.review("next", env=self.fault_env("advance"), ok=False)
         self.assertEqual(self.status()["phase"], "advancing")
+        listing = self.review("list").stdout
+        self.assertIn("Total: 1 | Completed: 1 | Remaining: 0", listing)
+        self.assertFalse(any(line.startswith(">") for line in listing.splitlines()))
         self.review("next")
         self.assertFalse(self.status()["active"])
         self.assertEqual(self.git("rev-parse", "HEAD"), first)
@@ -475,6 +478,73 @@ class ReviewTest(unittest.TestCase):
         self.review("start", last, ok=False)
         self.assertEqual(self.git("rev-parse", "HEAD"), last)
         self.assertFalse(self.status()["active"])
+
+    def test_list_tracks_progress_without_changing_review_edits(self):
+        self.assertIn("No active review", self.review("list").stdout)
+        self.write("one.txt", "one\n")
+        first = self.commit("first")
+        self.write("two.txt", "two\n")
+        second = self.commit("second")
+        self.write("three.txt", "three\n")
+        third = self.commit("third")
+        self.review("start", first)
+        listing = self.review("list").stdout
+        self.assertIn("Total: 3 | Completed: 0 | Remaining: 3 (including current)", listing)
+        rows = [line.split() for line in listing.splitlines() if " - " in line]
+        self.assertEqual([row[-3] for row in rows], [first[:12], second[:12], third[:12]])
+        self.assertEqual(rows[0][:3], [">", "1", "current"])
+        self.write("one.txt", "staged edit\n")
+        self.git("add", "one.txt")
+        self.write("one.txt", "unstaged edit\n")
+        state_before = self.active_path().read_bytes()
+        index = Path(self.git("rev-parse", "--absolute-git-dir")) / "index"
+        index_before = index.read_bytes()
+        head_before = self.git("rev-parse", "HEAD")
+        self.review("list")
+        self.assertEqual(self.active_path().read_bytes(), state_before)
+        self.assertEqual(index.read_bytes(), index_before)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head_before)
+        self.assertEqual((self.repo / "one.txt").read_text(), "unstaged edit\n")
+        self.review("next")
+        listing = self.review("list").stdout
+        self.assertIn("Total: 3 | Completed: 1 | Remaining: 2 (including current)", listing)
+        rows = [line.split() for line in listing.splitlines() if " - " in line]
+        self.assertEqual(rows[0][:2], ["1", "done"])
+        self.assertEqual(rows[1][:3], [">", "2", "current"])
+        self.assertEqual(rows[2][:2], ["3", "pending"])
+        self.review("next")
+        self.assertIn("Completed: 2 | Remaining: 1", self.review("list").stdout)
+        self.review("next")
+        self.assertIn("No active review", self.review("list").stdout)
+
+    def test_list_counts_current_conflict_as_remaining(self):
+        first, second, third, _ = self.conflicting_history()
+        conflict_before = (self.repo / "value.txt").read_bytes()
+        state_before = self.active_path().read_bytes()
+        unmerged_before = self.git("ls-files", "--unmerged")
+        listing = self.review("list").stdout
+        self.assertIn("Completed: 1 | Remaining: 2 (including current)", listing)
+        current_row = next(line.split() for line in listing.splitlines() if line.startswith(">"))
+        self.assertEqual(current_row[:4], [">", "2", "conflict", second[:12]])
+        self.assertEqual((self.repo / "value.txt").read_bytes(), conflict_before)
+        self.assertEqual(self.active_path().read_bytes(), state_before)
+        self.assertEqual(self.git("ls-files", "--unmerged"), unmerged_before)
+
+    def test_list_does_not_count_an_already_saved_commit_as_remaining(self):
+        self.write("one.txt", "one\n")
+        first = self.commit("first")
+        self.write("two.txt", "two\n")
+        self.commit("second")
+        self.review("start", first)
+        self.write("one.txt", "edited\n")
+        hook = self.repo / ".git/hooks/post-commit"
+        hook.write_text("#!/bin/sh\nprintf 'temporary\\n' > scratch.txt\n")
+        hook.chmod(0o755)
+        self.review("next", ok=False)
+        self.assertEqual(self.status()["phase"], "saved")
+        listing = self.review("list").stdout
+        self.assertIn("Completed: 1 | Remaining: 1", listing)
+        self.assertFalse(any(line.startswith(">") for line in listing.splitlines()))
 
 
 if __name__ == "__main__":

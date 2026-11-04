@@ -9,6 +9,8 @@ description: Review, edit, and advance Git commits with the git-review tool. Use
 
 Run `git review status --json` in the repository specified by the user. When working over SSH, run it in the actual remote repository. If the command is unavailable in a non-login SSH session, use `~/git-review/git-review status --json`. Do not substitute local repository state for remote state.
 
+Use `git review list` for an ordered overview of completed, current, and pending commits. The remaining count includes the current commit; a conflicting commit is labeled `conflict`. This command only reads progress. A request to list commits or check progress does not authorize running `next`.
+
 - `active: false`: There is no session managed by this tool. Run `git review start <commit>` only when the user asks to start a review; do not turn an ordinary editing request into a history rewrite.
 - `active: true`: Read `phase`, `current`, `completed`, `remaining`, `conflicts`, and `changed_files` to identify the commit being edited. Use `git diff HEAD` and `git show <current.sha>` for additional context.
 - `reviewing`: HEAD is the current commit's parent, and the working tree contains the full set of changes under review. These uncommitted changes are part of the workflow; do not discard them to "clean up" the repository.

@@ -430,6 +430,29 @@ class Review:
                 "conflicts": conflicts, "changed_files": self.changed_paths(), "untracked_files": self.untracked(),
                 "rebase_active": self.rebase_active(), "next_action": "git review next"}
 
+    def print_list(self):
+        if not self.state:
+            print("No active review. Run: git review start <commit>")
+            return
+        state = self.state
+        commits = state["commits"]
+        completed = {item["old"] for item in state["saved"]}
+        remaining = len(commits) - len(completed)
+        print(f"Branch: {state['branch'].removeprefix('refs/heads/')} | Phase: {state['phase']}")
+        print(f"Total: {len(commits)} | Completed: {len(completed)} | Remaining: {remaining} (including current)")
+        print()
+        width = len(str(len(commits)))
+        for index, commit in enumerate(commits):
+            is_current = index == state["index"] and commit["sha"] not in completed
+            if commit["sha"] in completed:
+                label = "done"
+            elif is_current:
+                label = "conflict" if state["phase"] == "conflict" else "current"
+            else:
+                label = "pending"
+            marker = ">" if is_current else " "
+            print(f"{marker} {index + 1:>{width}}  {label:<7}  {commit['sha'][:12]} - {commit['subject']}")
+
     def print_status(self, as_json=False):
         data = self.status_data()
         if as_json:
@@ -479,6 +502,7 @@ def main():
     start = sub.add_parser("start", help="Review from the specified commit, inclusive, through the current HEAD")
     start.add_argument("commit")
     sub.add_parser("next", help="Save the current commit or conflict resolution and open the next commit")
+    sub.add_parser("list", help="List commits and show how many remain, including the current commit")
     status = sub.add_parser("status", help="Show review progress and conflicting files")
     status.add_argument("--json", action="store_true", help="Output machine-readable JSON for AI agents and scripts")
     sub.add_parser("abort", help="Save a recovery snapshot, cancel the review, and restore the original branch")
@@ -492,6 +516,8 @@ def main():
                 review.next()
             elif args.command == "abort":
                 review.abort()
+            elif args.command == "list":
+                review.print_list()
             else:
                 review.print_status(args.json)
         return 0
