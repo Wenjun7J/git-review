@@ -50,6 +50,26 @@ The original commit message, author, and author timestamp are preserved by defau
 
 The final `next` completes the review and updates the original local branch. The tool does not push. The original history backup and the mapping between old and new SHAs are stored in Git metadata.
 
+## Going back to a saved commit
+
+```bash
+git review prev
+# Inspect or edit the previous commit in VS Code
+git review next
+```
+
+`prev` reopens the previous **saved version**, including edits you made before running `next`. Its full changes appear unstaged against its parent, just like a newly opened commit. You can edit it again and use `next` to save and move forward.
+
+Before moving back, the tool stores the current tracked files and explicitly added files in a durable draft. It does not mark that commit as reviewed. Untracked files stay in place and are not silently included; ignored or untracked files that would be overwritten block the move. The draft backup ref is printed before switching commits.
+
+You can run `prev` repeatedly. For example, from commit C, run `prev` to reopen the saved B, then `prev` to reopen the saved A. Running `next` saves A and replays the preserved B draft, then saves B and replays the preserved C draft. Later commits retain the edits saved during previous passes, as well as unfinished edits captured when moving back. Their changes are applied onto the newly reviewed parents, so new conflicts may need resolution.
+
+You can also move back while the current commit has unresolved conflicts. Conflict markers, partial edits, and unresolved binary or deletion choices are preserved in the draft. When that draft returns, unresolved choices still block `next`. If editing the earlier commit causes additional conflicts, the tool lists the affected files and preserves both sides. A draft containing old markers may need those markers resolved along with any new ones.
+
+At the first commit in the review range, `prev` reports that there is no earlier commit and leaves the files and progress unchanged. After the final `next`, `prev` can reopen the last saved commit of a completed review on the same branch, provided HEAD still matches that result and the working tree is clean. Earlier commits from that review can then be reopened too. Aborting this reopened session restores the completed result from before it was reopened.
+
+`prev` uses Git's [editable rebase queue](https://git-scm.com/docs/git-rebase) to revisit saved versions and replay drafts. It does not change the original branch until the review finishes. Do not manually reset, commit, or manipulate the rebase while a review is active.
+
 ## Conflicts
 
 If an edited commit conflicts with the next commit, the previous commit has already been saved. The tool stops at the next commit and lists affected files and marker line numbers. Ordinary text conflicts preserve both sides using Git's standard markers:
@@ -74,7 +94,7 @@ git review list
 git review status --json
 ```
 
-`git review list` shows the ordered commit list and a summary of completed and remaining commits. The remaining count includes the current commit. Each row shows its position, status, original SHA, and subject; `>` marks the current commit. A conflicting commit is labeled `conflict`:
+`git review list` shows the ordered commit list and a summary of completed and remaining commits. The remaining count includes the current commit. Each row shows its position, status, original SHA, and subject; `>` marks the current commit. A conflicting commit is labeled `conflict`. After moving back, preserved future changes are labeled `draft`; reopened commits count as remaining until saved again:
 
 ```text
 Branch: feature | Phase: reviewing
@@ -87,7 +107,7 @@ Total: 3 | Completed: 1 | Remaining: 2 (including current)
 
 Listing commits does not change files, staging, HEAD, or review progress. If no review is active, it prints a message explaining how to start one.
 
-The JSON output includes `active`, `phase`, the current commit and its position, remaining commits, the original branch, saved SHA mappings, conflict files and marker lines, changed files, and the backup ref. With no active session, it returns `active: false` and exits successfully. Unexpected Git metadata or external operations cause the tool to report an error and preserve the current state.
+The JSON output includes `active`, `phase`, the current commit and its position, remaining commits, the original branch, saved SHA mappings, conflict files and marker lines, changed files, and the backup ref. `current.sha` identifies the original commit; `current.replay_sha` identifies the saved version or draft currently being reviewed. `drafts` records preserved changes and their backup refs. With no active session, it returns `active: false` and exits successfully. Unexpected Git metadata or external operations cause the tool to report an error and preserve the current state.
 
 The optional [git-review skill](skills/git-review/SKILL.md) tells an AI agent to check the session state before editing the current commit. Invoke it with `$git-review` in Codex or `/git-review` in Claude Code; for example, ask it to edit the current commit, then run next. The skill does not depend on context from an earlier conversation. A request to edit files alone does not authorize advancing the review. An ordinary Git rebase is not treated as a git-review session. All command-line review operations work without the skill.
 
@@ -109,9 +129,9 @@ git restore --source=<recovery-ref> -- path/to/file
 git log <backup-ref>
 ```
 
-Session state lives in `git-review/` under the directory reported by `git rev-parse --absolute-git-dir`. Each linked worktree has its own state and lock. Completed and aborted session records live in `git-review/history/`. Backups use `refs/git-review/backups/` and `refs/git-review/recovery/` and are not automatically deleted.
+Session state lives in `git-review/` under the directory reported by `git rev-parse --absolute-git-dir`. Each linked worktree has its own state and lock. Completed and aborted session records live in `git-review/history/`. Backups use `refs/git-review/backups/`, `refs/git-review/recovery/`, and `refs/git-review/drafts/` and are not automatically deleted. Aborting after `prev` also prints the refs for preserved future drafts; inspect them with `git show <draft-ref>:path/to/file`.
 
-You can close the terminal and continue later. If a commit hook fails, your edits remain available; fix the issue and retry `next`. After an interrupted Git operation, check `status` first. The tool records key phases so operations can be retried at known boundaries. Manually switching branches, committing, resetting, changing the original branch ref, or manipulating the rebase breaks the session's assumptions. The tool stops when it detects an inconsistency rather than guessing how to proceed. Automatic recovery from every possible forced termination or external Git operation is not guaranteed.
+You can close the terminal and continue later. If a commit hook fails, your edits remain available; fix the issue and retry `next`. After an interrupted Git operation, check `status` first. The tool records key phases so operations can be retried at known boundaries. In the `rewinding` phase, retrying `prev` or `next` finishes opening the earlier commit without saving it. Manually switching branches, committing, resetting, changing the original branch ref, or manipulating the rebase breaks the session's assumptions. The tool stops when it detects an inconsistency rather than guessing how to proceed. Automatic recovery from every possible forced termination or external Git operation is not guaranteed.
 
 ## Prototype scope
 

@@ -17,7 +17,7 @@ class InstallTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="git-review-install-test-")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.test_home = self.root / "home"
         self.test_home.mkdir()
         self.executables = self.root / "executables"

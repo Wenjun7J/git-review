@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -108,6 +109,9 @@ class Review:
     def current(self):
         return self.state["commits"][self.state["index"]]
 
+    def replay_sha(self):
+        return self.state.get("revisions", {}).get(self.current()["sha"], self.current()["sha"])
+
     def changed_paths(self):
         return paths(self.run("diff", "--name-only", "-z", "HEAD", "--").stdout)
 
@@ -151,16 +155,18 @@ class Review:
         if self.out("rev-parse", branch) != self.state["original_head"]:
             raise ReviewError("The original branch changed outside this review. Stopping to avoid overwriting it.")
 
-    def rebase(self, *args):
+    def rebase(self, *args, todo=None):
         helper = str(Path(__file__).resolve())
         editor = shlex.join([sys.executable, helper, "--sequence-editor"])
+        if todo is not None:
+            editor = shlex.join([sys.executable, helper, "--replace-todo", str(todo)])
         return self.run("-c", "core.editor=true", "-c", "merge.conflictStyle=merge",
                         "-c", "rerere.enabled=false", "-c", "rebase.instructionFormat=%s",
                         "-c", "rebase.abbreviateCommands=false",
                         "-c", "rebase.rescheduleFailedExec=false", "rebase", *args,
                         env={"GIT_SEQUENCE_EDITOR": editor, "GIT_EDITOR": "true"}, check=False)
 
-    def start(self, revision):
+    def start(self, revision, completed=None):
         if self.state:
             raise ReviewError("A review is already active. Use next or abort first.")
         for item in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "BISECT_LOG"):
@@ -203,6 +209,10 @@ class Review:
         self.state = {"version": 1, "id": session_id, "phase": "starting", "branch": decoded(branch_result.stdout).strip(),
                       "original_head": original, "backup_ref": backup, "root": str(self.root),
                       "commits": commits, "index": 0, "saved": [], "conflicts": []}
+        if completed:
+            self.state.update(commits=completed["commits"], index=len(completed["commits"]) - 1,
+                              saved=completed["saved"][:-1], reopened_from=completed["id"],
+                              revisions={item["old"]: item["new"] for item in completed["saved"]})
         self.save()
         result = self.rebase("--interactive", "--no-autosquash", "--no-update-refs", "--no-autostash",
                              "--no-rebase-merges", "--keep-empty", "--reapply-cherry-picks", "--empty=keep", base)
@@ -220,10 +230,11 @@ class Review:
         if self.state["index"] >= len(self.state["commits"]):
             detail = (result.stderr + result.stdout).decode(errors="replace") if result else ""
             raise ReviewError("Git has not finished the rebase. Resolve the following issue, then retry next.\n" + detail)
-        if self.stopped_sha() != self.current()["sha"]:
+        if self.stopped_sha() != self.replay_sha():
             detail = (result.stderr + result.stdout).decode(errors="replace") if result else ""
             raise ReviewError("Git stopped at a different commit than the review expected. The current state has been preserved.\n" + detail)
         unresolved = self.unmerged()
+        self.state.pop("rewind", None)
         if unresolved:
             conflicts = []
             for path, stages in sorted(unresolved.items()):
@@ -234,6 +245,7 @@ class Review:
                 conflicts.append({"path": path, "kind": "text" if text and lines else "manual",
                                   "initial_marker_lines": lines})
             self.state.update(phase="conflict", parent=self.head(), conflicts=conflicts)
+            self.restore_draft_conflicts()
             self.save()
             self.print_status()
             return
@@ -249,8 +261,162 @@ class Review:
         elif current_head != self.state["parent"]:
             raise ReviewError("HEAD changed unexpectedly while exposing the commit's changes. Stopping.")
         self.state["phase"] = "reviewing"
+        self.restore_draft_conflicts()
         self.save()
         self.print_status()
+
+    @contextlib.contextmanager
+    def temporary_index(self, tree=None):
+        fd, name = tempfile.mkstemp(prefix="review-index-", dir=self.directory)
+        os.close(fd)
+        env = {"GIT_INDEX_FILE": name}
+        try:
+            if tree is None:
+                shutil.copyfile(self.gitdir / "index", name)
+            else:
+                os.unlink(name)
+                self.run("read-tree", tree, env=env)
+            yield name, env
+        finally:
+            for file in (name, name + ".lock"):
+                if os.path.exists(file):
+                    os.unlink(file)
+
+    def protect_untracked(self, target):
+        # Git may overwrite ignored files during checkout. Check all untracked
+        # paths, without ignore exclusions, including file/directory collisions.
+        incoming = set(paths(self.run("ls-tree", "-r", "--name-only", "-z", target).stdout))
+        directories = {path[:pos] for path in incoming for pos, char in enumerate(path) if char == "/"}
+        collisions = []
+        for path in paths(self.run("ls-files", "--others", "-z").stdout):
+            path = path.rstrip("/")
+            parents = {path[:pos] for pos, char in enumerate(path) if char == "/"}
+            if path in incoming or path in directories or parents & incoming:
+                collisions.append(path)
+        if collisions:
+            raise ReviewError("Switching commits would overwrite untracked or ignored files. Move these files away first:\n"
+                              + "\n".join("  " + display(path) for path in collisions))
+
+    def switch_tree(self, source, target, dry_run=False):
+        # Keep the real index and its conflict stages until checkout succeeds.
+        self.protect_untracked(target)
+        with self.temporary_index(source) as (name, env):
+            self.run("update-index", "--refresh", env=env, check=False)
+            if self.run("diff-files", "--quiet", env=env, check=False).returncode:
+                raise ReviewError("Files changed after the draft was saved. Stopping; inspect status and the draft backup before retrying.")
+            if dry_run:
+                self.run("read-tree", "-n", "-m", "-u", source, target, env=env)
+                return
+            lock = self.gitdir / "index.lock"
+            with lock.open("xb") as handle:
+                try:
+                    self.run("read-tree", "-m", "-u", source, target, env=env)
+                    handle.write(Path(name).read_bytes())
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    os.replace(lock, self.gitdir / "index")
+                finally:
+                    if lock.exists():
+                        lock.unlink()
+
+    def prev(self):
+        if not self.state:
+            branch = decoded(self.run("symbolic-ref", "-q", "HEAD", check=False).stdout).strip()
+            history = sorted((self.directory / "history").glob("*.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
+            for path in history:
+                completed = json.loads(path.read_text())
+                if (completed.get("outcome") == "completed" and completed["branch"] == branch
+                        and completed.get("result_head") == self.head()):
+                    self.start(completed["result_head"], completed=completed)
+                    return
+            raise ReviewError("No active review or completed review at the current branch tip. Run git review start <commit> first.")
+        self.check_session()
+        if self.state["phase"] == "rewinding":
+            self.resume_rewind()
+            return
+        if self.state["phase"] not in ("reviewing", "conflict"):
+            raise ReviewError("An operation is unfinished. Run next to recover it before using prev.")
+        if self.state["index"] == 0:
+            raise ReviewError("Already at the first commit in this review. Nothing has changed.")
+        if self.head() != self.state["parent"] or self.stopped_sha() != self.replay_sha():
+            raise ReviewError("Git's position changed outside this review. Stopping with the current state preserved.")
+        previous = self.state["saved"][-1]
+        target = previous["new"]
+        parent = self.out("rev-parse", target + "^")
+        original = self.current()["sha"]
+        old_draft = self.state.get("drafts", {}).get(original, {})
+        draft_ref = self.snapshot(draft=True)
+        draft = {"sha": self.out("rev-parse", draft_ref), "ref": draft_ref,
+                 "reuse": old_draft.get("reuse", self.replay_sha()),
+                 "conflicts": self.state["conflicts"], "unmerged": self.unmerged()}
+        self.switch_tree(draft["sha"], parent, dry_run=True)
+        self.switch_tree(draft["sha"], target, dry_run=True)
+        pending = (self.gitdir / "rebase-merge" / "git-rebase-todo").read_text()
+        rewind = {"from_head": self.head(), "from_sha": self.stopped_sha(),
+                  "target": target, "parent": parent, "draft": draft["sha"],
+                  "todo": f"edit {target}\nedit {draft['sha']}\n" + pending}
+        self.state.setdefault("drafts", {})[original] = draft
+        self.state["drafts"].pop(previous["old"], None)
+        self.state.setdefault("revisions", {}).update({original: draft["sha"], previous["old"]: target})
+        self.state.update(phase="rewinding", rewind=rewind, index=self.state["index"] - 1,
+                          saved=self.state["saved"][:-1], parent=parent, conflicts=[])
+        self.save()
+        print(f"Current edits preserved in draft: {draft_ref}")
+        self.resume_rewind()
+
+    def resume_rewind(self):
+        rewind = self.state["rewind"]
+        if self.stopped_sha() == rewind["target"]:
+            self.receive_stop()
+            return
+        if self.stopped_sha() != rewind["from_sha"] or self.head() not in (rewind["from_head"], rewind["parent"]):
+            raise ReviewError("Git's position changed while rewinding. Drafts and progress have been preserved.")
+        todo = self.directory / "rewind-todo"
+        todo.write_text(rewind["todo"])
+        result = self.rebase("--edit-todo", todo=todo)
+        if result.returncode:
+            raise ReviewError("Could not update the review queue:\n" + decoded(result.stderr + result.stdout))
+        at_parent = (not self.unmerged()
+                     and self.out("write-tree") == self.out("rev-parse", rewind["parent"] + "^{tree}")
+                     and not self.run("diff-files", "--quiet", check=False).returncode)
+        if not at_parent:
+            self.switch_tree(rewind["draft"], rewind["parent"])
+        # Only move the detached HEAD after the files and index are safely switched.
+        if self.head() != rewind["parent"]:
+            self.run("update-ref", "--no-deref", "HEAD", rewind["parent"], rewind["from_head"])
+        self.protect_untracked(rewind["target"])
+        result = self.rebase("--skip")
+        self.receive_stop(result)
+
+    def restore_draft_conflicts(self):
+        draft = self.state.get("drafts", {}).get(self.current()["sha"])
+        if not draft:
+            return
+        # Replaying a draft can create new conflicts. Preserve those stages; retain
+        # the old unresolved choices too, even if the draft itself applied cleanly.
+        unresolved = self.unmerged()
+        records = []
+        for path, stages in draft["unmerged"].items():
+            if path in unresolved:
+                continue
+            stages = dict(stages)
+            ours = self.run("ls-tree", "-z", self.state["parent"], "--", ":(literal)" + path).stdout
+            stages.pop("2", None)
+            if ours:
+                mode, _, oid = ours.split(b"\t", 1)[0].split()
+                stages["2"] = (decoded(mode), decoded(oid))
+            encoded = os.fsencode(path)
+            zero = b"0" * len(self.head())
+            records.append(b"0 " + zero + b"\t" + encoded + b"\0")
+            for stage, (mode, oid) in sorted(stages.items()):
+                records.append(f"{mode} {oid} {stage}\t".encode() + encoded + b"\0")
+        if records:
+            self.run("update-index", "-z", "--index-info", data=b"".join(records))
+        conflicts = {item["path"]: item for item in draft["conflicts"]}
+        conflicts.update({item["path"]: item for item in self.state["conflicts"]})
+        self.state["conflicts"] = list(conflicts.values())
+        if conflicts:
+            self.state["phase"] = "conflict"
 
     def validate_edits(self):
         marker_errors = []
@@ -276,6 +442,9 @@ class Review:
             return
         self.check_session()
         phase = self.state["phase"]
+        if phase == "rewinding":
+            self.resume_rewind()
+            return
         if phase == "starting":
             self.receive_stop()
             return
@@ -301,16 +470,18 @@ class Review:
             return
         if self.head() != self.state["parent"]:
             raise ReviewError("HEAD changed outside this review. Do not commit, reset, or switch branches manually during a review. Stopping with the current state preserved.")
-        if self.stopped_sha() != self.current()["sha"]:
+        if self.stopped_sha() != self.replay_sha():
             raise ReviewError("Git's current commit does not match the review state. Stopping.")
         self.validate_edits()
         self.state.update(phase="saving", save_from=self.state["phase"])
         self.save()
-        self.run("add", "-u", "--", ".")
+        self.run("add", "-u")
         tree = self.out("write-tree")
         current = self.current()
-        if tree == current["tree"] and self.head() == current["parent"]:
-            self.run("reset", "--soft", current["sha"])
+        draft = self.state.get("drafts", {}).get(current["sha"], {})
+        reuse = draft.get("reuse", self.replay_sha())
+        if tree == self.out("rev-parse", reuse + "^{tree}") and self.head() == self.out("rev-parse", reuse + "^"):
+            self.run("reset", "--soft", reuse)
         else:
             try:
                 self.run("commit", "--allow-empty", "--reuse-message=" + current["sha"])
@@ -343,7 +514,7 @@ class Review:
             self.state["phase"] = self.state["save_from"]
             self.save()
             raise ReviewError("A commit hook left additional changes. The current commit has been reopened for review; inspect the changes before running next again.")
-        self.state.update(phase="advancing", previous_sha=self.current()["sha"], index=self.state["index"] + 1)
+        self.state.update(phase="advancing", previous_sha=self.replay_sha(), index=self.state["index"] + 1)
         self.save()
         self.resume_advance()
 
@@ -351,6 +522,8 @@ class Review:
         # Persisted before invoking rebase: a restart can distinguish "not run yet"
         # from "already stopped at the next commit" using native rebase metadata.
         if self.stopped_sha() == self.state["previous_sha"]:
+            if self.state["index"] < len(self.state["commits"]) and self.current()["sha"] in self.state.get("drafts", {}):
+                self.protect_untracked(self.replay_sha())
             result = self.rebase("--continue")
             self.receive_stop(result)
         else:
@@ -369,26 +542,20 @@ class Review:
         print(f"Original history backup: {self.state['backup_ref']}")
         print("Results have been saved locally. Nothing was pushed.")
 
-    def snapshot(self):
-        # A separate index records even conflict markers and untracked files without
-        # resolving or modifying the real index. The ref makes the snapshot durable.
-        fd, name = tempfile.mkstemp(prefix="recovery-index-", dir=self.directory)
-        os.close(fd)
-        os.unlink(name)
-        env = {"GIT_INDEX_FILE": name}
-        try:
-            self.run("read-tree", "HEAD", env=env)
-            self.run("add", "-A", "--", ".", env=env)
+    def snapshot(self, draft=False):
+        # Preserve conflict text without touching the real index. Recovery also
+        # includes untracked files; drafts only include files already in the index.
+        with self.temporary_index(None if draft else "HEAD") as (_, env):
+            self.run("add", "-u" if draft else "-A", env=env)
             tree = decoded(self.run("write-tree", env=env).stdout).strip()
+            message = f"git-review draft of {self.current()['sha']}\n".encode() if draft else b"git-review recovery snapshot\n"
             sha = decoded(self.run("commit-tree", tree, "-p", self.head(),
-                                   data=b"git-review recovery snapshot\n").stdout).strip()
+                                   data=message).stdout).strip()
             ref = "refs/git-review/recovery/" + self.state["id"]
+            if draft:
+                ref = "refs/git-review/drafts/" + self.state["id"] + "/" + uuid.uuid4().hex[:12]
             self.run("update-ref", ref, sha)
             return ref
-        finally:
-            for file in (name, name + ".lock"):
-                if os.path.exists(file):
-                    os.unlink(file)
 
     def abort(self):
         if not self.state:
@@ -406,6 +573,10 @@ class Review:
         self.archive("aborted")
         print("Review aborted. The branch has been restored to its original position.")
         print(f"Files and commits saved before the abort can be recovered from: {self.state['recovery_ref']}")
+        if self.state.get("drafts"):
+            print("Drafts preserved while moving back:")
+            for draft in self.state["drafts"].values():
+                print("  " + draft["ref"])
         if self.untracked():
             print("Additional untracked files remain in the working tree; they were not deleted.")
 
@@ -423,12 +594,14 @@ class Review:
         current = dict(self.current()) if state["index"] < len(state["commits"]) else None
         if current:
             current["number"] = state["index"] + 1
+            current["replay_sha"] = self.replay_sha()
         return {"active": True, "repository": str(self.root), "phase": state["phase"],
                 "branch": state["branch"].removeprefix("refs/heads/"), "original_head": state["original_head"],
                 "head": self.head(), "backup_ref": state["backup_ref"], "total": len(state["commits"]),
                 "current": current, "completed": state["saved"], "remaining": state["commits"][state["index"]:],
                 "conflicts": conflicts, "changed_files": self.changed_paths(), "untracked_files": self.untracked(),
-                "rebase_active": self.rebase_active(), "next_action": "git review next"}
+                "rebase_active": self.rebase_active(), "next_action": "git review next",
+                "drafts": state.get("drafts", {})}
 
     def print_list(self):
         if not self.state:
@@ -448,6 +621,8 @@ class Review:
                 label = "done"
             elif is_current:
                 label = "conflict" if state["phase"] == "conflict" else "current"
+            elif commit["sha"] in state.get("drafts", {}):
+                label = "draft"
             else:
                 label = "pending"
             marker = ">" if is_current else " "
@@ -465,6 +640,8 @@ class Review:
         print(f"Branch: {data['branch']} | Phase: {data['phase']}")
         if current:
             print(f"Current [{current['number']}/{data['total']}]: {current['sha'][:12]} - {current['subject']}")
+            if current["replay_sha"] != current["sha"]:
+                print(f"Review source (saved version or draft): {current['replay_sha'][:12]}")
         if data["conflicts"]:
             marked = [c for c in data["conflicts"] if c["marker_lines"]]
             if marked:
@@ -496,12 +673,16 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--sequence-editor":
         sequence_editor(sys.argv[2])
         return 0
+    if len(sys.argv) == 4 and sys.argv[1] == "--replace-todo":
+        Path(sys.argv[3]).write_bytes(Path(sys.argv[2]).read_bytes())
+        return 0
     parser = argparse.ArgumentParser(description="Review and edit Git commits one at a time as unstaged changes.")
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
     start = sub.add_parser("start", help="Review from the specified commit, inclusive, through the current HEAD")
     start.add_argument("commit")
     sub.add_parser("next", help="Save the current commit or conflict resolution and open the next commit")
+    sub.add_parser("prev", help="Preserve the current edits and reopen the previous saved commit for editing")
     sub.add_parser("list", help="List commits and show how many remain, including the current commit")
     status = sub.add_parser("status", help="Show review progress and conflicting files")
     status.add_argument("--json", action="store_true", help="Output machine-readable JSON for AI agents and scripts")
@@ -514,6 +695,8 @@ def main():
                 review.start(args.commit)
             elif args.command == "next":
                 review.next()
+            elif args.command == "prev":
+                review.prev()
             elif args.command == "abort":
                 review.abort()
             elif args.command == "list":
